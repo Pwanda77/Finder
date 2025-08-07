@@ -9,10 +9,6 @@ BASE_URL = "https://cnfans.com"
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_exchange_rates():
-    """
-    Fetch latest currency exchange rates from exchangerate.host API.
-    Base is CNY, retrieving USD and EUR rates.
-    """
     url = "https://api.exchangerate.host/latest?base=CNY&symbols=USD,EUR"
     try:
         response = requests.get(url, timeout=10)
@@ -24,18 +20,51 @@ def get_exchange_rates():
             "USD": rates.get("USD", None)
         }
     except Exception:
-        # On failure, fallback to None
         return {"EUR": None, "USD": None}
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def fetch_product_page(url: str) -> BeautifulSoup | None:
+    """Fetch product detail page and return BeautifulSoup object"""
+    scraper = cloudscraper.create_scraper()
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Connection": "keep-alive",
+    }
+    try:
+        response = scraper.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        return BeautifulSoup(response.text, "html.parser")
+    except Exception as e:
+        st.warning(f"Failed to fetch product page {url}: {e}")
+        return None
+
+def find_spreadsheet_links(soup: BeautifulSoup) -> list[str]:
+    """
+    Search the product page content for Google Sheets URLs or other spreadsheet links.
+    Returns a list of unique spreadsheet URLs.
+    """
+    spreadsheet_links = set()
+
+    # Find all <a> tags href containing docs.google.com/spreadsheets
+    for a_tag in soup.find_all("a", href=True):
+        href = a_tag["href"]
+        if "docs.google.com/spreadsheets" in href.lower():
+            spreadsheet_links.add(href.split("?")[0])  # remove URL parameters for neatness
+
+    # Additionally, search raw text for spreadsheet URLs (just in case)
+    text = soup.get_text()
+    found_urls = re.findall(r"https?://docs\.google\.com/spreadsheets/[^\s'\"]+", text, re.IGNORECASE)
+    for url in found_urls:
+        spreadsheet_links.add(url.split("?")[0])
+
+    return list(spreadsheet_links)
 
 @st.cache_data(show_spinner=False)
 def search_cnfans(keyword: str, max_price: float | None = None, max_results: int = 20):
-    """
-    Scrapes cnfans.com for products matching the keyword.
-    Converts prices from CNY to EUR and USD using live exchange rates.
-    Applies max_price filter on CNY price and limits results to max_results.
-    Returns a list of dict with Title, Prices, Link and Image URL.
-    """
     exchange_rates = get_exchange_rates()
     cny_to_eur = exchange_rates["EUR"] if exchange_rates["EUR"] else 0.13
     cny_to_usd = exchange_rates["USD"] if exchange_rates["USD"] else 0.14
@@ -45,9 +74,8 @@ def search_cnfans(keyword: str, max_price: float | None = None, max_results: int
 
     headers = {
         "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/114.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36"
         ),
         "Accept-Language": "en-US,en;q=0.9",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,image/apng,*/*;q=0.8",
@@ -66,12 +94,22 @@ def search_cnfans(keyword: str, max_price: float | None = None, max_results: int
 
     soup = BeautifulSoup(response.text, "html.parser")
 
-    # Try finding product containers; adjust selectors if site changes
-    products = soup.find_all("li", class_="product-item")
-    if not products:
-        products = soup.find_all("div", class_="product-list-item")
+    product_selectors = [
+        ("li", "product-item"),
+        ("div", "product-list-item"),
+        ("div", "search-item"),
+        ("div", "item"),
+    ]
+
+    products = []
+    for tag, class_name in product_selectors:
+        found = soup.find_all(tag, class_=class_name)
+        if found:
+            products = found
+            break
 
     if not products:
+        st.warning("Could not find product elements with current selectors. Site structure may have changed.")
         return []
 
     results = []
@@ -81,60 +119,71 @@ def search_cnfans(keyword: str, max_price: float | None = None, max_results: int
         if count >= max_results:
             break
 
-        # Extract product title
-        title_tag = product.find("a", class_="product-title") or product.find("h3")
-        # Extract price element
-        price_tag = product.find("span", class_="price") or product.find("div", class_="price")
-        # Extract product link
-        link_tag = product.find("a", href=True)
-        # Extract product image
-        img_tag = product.find("img")
-        
-        if not (title_tag and price_tag and link_tag):
-            continue
-
-        title = title_tag.get_text(strip=True)
-
-        price_text = price_tag.get_text(strip=True).replace("¥", "").replace(",", "")
         try:
-            price_cny = float(re.search(r"[\d.]+", price_text).group())
-        except Exception:
-            price_cny = 99999  # fallback
+            title_tag = product.find("a", class_="product-title") or product.find("h3") or product.find("a")
+            if not title_tag:
+                continue
 
-        if max_price is not None and price_cny > max_price:
+            title = title_tag.get_text(strip=True)
+
+            price_tag = product.find("span", class_="price") or product.find("div", class_="price") or product.find("em", class_="price") or product.find("span")
+            if not price_tag:
+                continue
+
+            price_text = price_tag.get_text(strip=True).replace("¥", "").replace(",", "")
+            price_numbers = re.findall(r"[\d.]+", price_text)
+            if not price_numbers:
+                continue
+            price_cny = float(price_numbers[0])
+
+            if max_price is not None and price_cny > max_price:
+                continue
+
+            link_tag = product.find("a", href=True)
+            if not link_tag:
+                continue
+
+            link = link_tag["href"]
+            if link.startswith("/"):
+                link = BASE_URL + link
+
+            img_tag = product.find("img")
+            img_url = None
+            if img_tag and img_tag.has_attr("src"):
+                img_url = img_tag["src"]
+                if img_url.startswith("/"):
+                    img_url = BASE_URL + img_url
+
+            # Fetch product page to find spreadsheet links
+            product_soup = fetch_product_page(link)
+            spreadsheet_links = find_spreadsheet_links(product_soup) if product_soup else []
+
+            price_eur = round(price_cny * cny_to_eur, 2)
+            price_usd = round(price_cny * cny_to_usd, 2)
+
+            results.append({
+                "Title": title,
+                "Price (¥)": price_cny,
+                "Price (€)": price_eur,
+                "Price ($)": price_usd,
+                "Link": link,
+                "ImgURL": img_url,
+                "Spreadsheet Links": spreadsheet_links,
+            })
+            count += 1
+        except Exception as e:
+            st.write(f"Skipped one product due to parsing error: {e}")
             continue
-
-        link = link_tag["href"]
-        if link.startswith("/"):
-            link = BASE_URL + link
-
-        img_url = img_tag["src"] if img_tag and img_tag.has_attr("src") else None
-        if img_url and img_url.startswith("/"):
-            img_url = BASE_URL + img_url
-
-        price_eur = round(price_cny * cny_to_eur, 2)
-        price_usd = round(price_cny * cny_to_usd, 2)
-
-        results.append({
-            "Title": title,
-            "Price (¥)": price_cny,
-            "Price (€)": price_eur,
-            "Price ($)": price_usd,
-            "Link": link,
-            "ImgURL": img_url,
-        })
-        count += 1
 
     return results
 
-
 def main():
-    st.set_page_config(page_title="CNFans.com Scraper with Images", layout="centered")
-    st.title("🛍️ CNFans.com Shop Scraper with Currency Conversion & Images")
+    st.set_page_config(page_title="CNFans.com Shop Scraper with Spreadsheets", layout="centered")
+    st.title("🛍️ CNFans.com Shop Scraper with Currency Conversion & Spreadsheet Links")
 
     keyword = st.text_input("🔍 Enter keyword to search:", placeholder="e.g., Jersey, Jeans")
     max_price = st.number_input("Maximum price in CNY (¥)", min_value=0.0, step=1.0, format="%.2f")
-    max_results = st.slider("Maximum number of results to display", 1, 50, 20)
+    max_results = st.slider("Maximum number of results to display", 1, 20, 10)
 
     exchange_rates = get_exchange_rates()
     cny_to_eur = exchange_rates["EUR"]
@@ -147,7 +196,6 @@ def main():
             f"**Max Price Specified:** {max_price:.2f} CNY ≈ {price_eur:.2f} EUR ≈ {price_usd:.2f} USD"
         )
     elif max_price > 0:
-        # fallback static rates if API fails
         price_eur = round(max_price * 0.13, 2)
         price_usd = round(max_price * 0.14, 2)
         st.markdown(
@@ -159,7 +207,7 @@ def main():
             st.warning("Please enter a search keyword before searching.")
             return
 
-        with st.spinner("🔎 Searching CNFans.com..."):
+        with st.spinner("🔎 Searching CNFans.com and scanning for spreadsheets... (this may take some seconds)"):
             results = search_cnfans(keyword, max_price=max_price if max_price > 0 else None, max_results=max_results)
 
         if not results:
@@ -168,9 +216,8 @@ def main():
 
         st.markdown("### Search Results")
 
-        # Display each result with image and clickable link
         for item in results:
-            cols = st.columns([1, 4])
+            cols = st.columns([1, 5])
             if item["ImgURL"]:
                 with cols[0]:
                     st.image(item["ImgURL"], width=100, use_column_width=False)
@@ -178,19 +225,19 @@ def main():
                 with cols[0]:
                     st.write("No Image")
 
-            # Title as clickable link with prices below
             with cols[1]:
-                st.markdown(
-                    f"### [{item['Title']}]({item['Link']})", 
-                    unsafe_allow_html=True
-                )
-                st.write(
-                    f"Price: {item['Price (¥)']:.2f} CNY ≈ {item['Price (€)']:.2f} EUR ≈ {item['Price ($)']:.2f} USD"
-                )
-                st.markdown(f"[Open Product Link]({item['Link']})")
+                st.markdown(f"### [{item['Title']}]({item['Link']})", unsafe_allow_html=True)
+                st.write(f"Price: {item['Price (¥)']:.2f} CNY ≈ {item['Price (€)']:.2f} EUR ≈ {item['Price ($)']:.2f} USD")
+                if item["Spreadsheet Links"]:
+                    st.markdown("**Spreadsheet Links:**")
+                    for url in item["Spreadsheet Links"]:
+                        st.markdown(f"- [Google Sheet]({url})", unsafe_allow_html=True)
+                else:
+                    st.write("*No spreadsheet links found*")
 
-        # Optionally, add CSV download without images and links for simplicity
+        # Prepare dataframe for CSV export -- flatten spreadsheet list to comma-separated string
         df = pd.DataFrame(results)
+        df["Spreadsheet Links"] = df["Spreadsheet Links"].apply(lambda links: ", ".join(links) if links else "")
         df_csv = df.drop(columns=["ImgURL"]).to_csv(index=False).encode("utf-8")
         st.download_button(
             label="Download results as CSV",
