@@ -7,7 +7,7 @@ import re
 @st.cache_data
 def search_cnfans(keyword, max_price=None, max_results=20):
     keyword_encoded = requests.utils.quote(keyword)
-    search_url = f"https://cnfans.shop/search?q={keyword_encoded}"
+    search_url = f"https://cnfans.shop/search?type=product&q={keyword_encoded}"
     headers = {"User-Agent": "Mozilla/5.0"}
     try:
         response = requests.get(search_url, headers=headers, timeout=10)
