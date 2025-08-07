@@ -4,75 +4,81 @@ from bs4 import BeautifulSoup
 import pandas as pd
 import re
 
-# Static exchange rates: adjust as needed or fetch live rates
+# Static exchange rates for conversions
 CNY_TO_EUR = 0.13
 CNY_TO_USD = 0.14
+
+BASE_URL = "https://cnfans.com"
 
 @st.cache_data
 def search_cnfans(keyword, max_price=None, max_results=20):
     keyword_encoded = requests.utils.quote(keyword)
-    # Try primary search URL pattern
-    urls_to_try = [
-        f"https://cnfans.shop/search?type=product&q={keyword_encoded}",
-        f"https://cnfans.shop/collections/all?q={keyword_encoded}"
-    ]
-    headers = {"User-Agent": "Mozilla/5.0"}
-    response = None
-    for url in urls_to_try:
-        try:
-            resp = requests.get(url, headers=headers, timeout=10)
-            if resp.status_code == 200:
-                response = resp
-                search_url_used = url
-                break
-        except requests.RequestException:
-            continue
-
-    if not response:
-        st.error("No valid search results page found (received 404 or network error).")
+    search_url = f"{BASE_URL}/search?keywords={keyword_encoded}&searchType=keywords"
+    headers = {
+        "User-Agent": "Mozilla/5.0"
+    }
+    try:
+        response = requests.get(search_url, headers=headers, timeout=10)
+        response.raise_for_status()
+    except requests.RequestException as e:
+        st.error(f"Network error: {e}")
         return pd.DataFrame()
 
     soup = BeautifulSoup(response.text, "html.parser")
-    products = soup.find_all("div", class_="product-card")
+
+    # Find product containers - update selector based on actual site structure:
+    products = soup.find_all("li", class_="product-item")
+    if not products:
+        # Try alternative selector if needed:
+        products = soup.find_all("div", class_="product-list-item")
 
     if not products:
-        st.info("No products found on the search page.")
+        st.info("No products found.")
         return pd.DataFrame()
 
     results = []
     count = 0
+
     for product in products:
         if count >= max_results:
             break
-        title_tag = product.find("h3")
-        price_tag = product.find("span", class_="price")
+
+        # Extract title
+        title_tag = product.find("a", class_="product-title") or product.find("h3")
+        # Extract price
+        price_tag = product.find("span", class_="price") or product.find("div", class_="price")
+        # Extract link
         link_tag = product.find("a", href=True)
 
-        if title_tag and price_tag and link_tag:
-            title = title_tag.text.strip()
-            price_text = price_tag.text.strip().replace("¥", "")
-            price_match = re.search(r"[\d,.]+", price_text)
-            if price_match:
-                try:
-                    price_cny = float(price_match.group().replace(",", ""))
-                except:
-                    price_cny = 99999
-            else:
-                price_cny = 99999  # fallback price high
+        if not (title_tag and price_tag and link_tag):
+            continue
 
-            link = "https://cnfans.shop" + link_tag["href"]
+        title = title_tag.get_text(strip=True)
+        price_text = price_tag.get_text(strip=True).replace("¥", "").replace(",", "")
+        try:
+            price_cny = float(re.search(r"[\d.]+", price_text).group())
+        except:
+            price_cny = 99999  # fallback for no price or parse error
 
-            if (not max_price) or (price_cny <= max_price):
-                price_eur = round(price_cny * CNY_TO_EUR, 2)
-                price_usd = round(price_cny * CNY_TO_USD, 2)
-                results.append({
-                    "Title": title,
-                    "Price (¥)": price_cny,
-                    "Price (€)": price_eur,
-                    "Price ($)": price_usd,
-                    "Link": link
-                })
-                count += 1
+        if max_price and price_cny > max_price:
+            continue
+
+        link = link_tag['href']
+        # If link is relative, prepend BASE_URL
+        if link.startswith("/"):
+            link = BASE_URL + link
+
+        price_eur = round(price_cny * CNY_TO_EUR, 2)
+        price_usd = round(price_cny * CNY_TO_USD, 2)
+
+        results.append({
+            "Title": title,
+            "Price (¥)": price_cny,
+            "Price (€)": price_eur,
+            "Price ($)": price_usd,
+            "Link": link,
+        })
+        count += 1
 
     return pd.DataFrame(results)
 
@@ -80,7 +86,7 @@ def make_clickable(link):
     return f'<a href="{link}" target="_blank">Open Link</a>'
 
 def main():
-    st.title("CNFans Shop Scraper with Currency Conversion")
+    st.title("CNFans.com Shop Scraper with Currency Conversion")
 
     keyword = st.text_input("Enter keyword to search:", "")
     max_price = st.number_input("Max price in CNY (¥):", min_value=0.0, step=1.0, format="%.2f")
