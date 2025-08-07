@@ -44,22 +44,29 @@ def fetch_product_page(url: str) -> BeautifulSoup | None:
 
 def find_spreadsheet_links(soup: BeautifulSoup) -> list[str]:
     """
-    Search the product page content for Google Sheets URLs or other spreadsheet links.
-    Returns a list of unique spreadsheet URLs.
+    Search the product page content for all Google Sheets URLs or other spreadsheet links,
+    including those with category/parameter parts.
+    Returns a list of unique spreadsheet URLs found.
     """
     spreadsheet_links = set()
 
-    # Find all <a> tags href containing docs.google.com/spreadsheets
+    # Regex to capture full Google Sheet URLs with spreadsheet ID and optional path/query
+    url_pattern = re.compile(
+        r"https?://docs\.google\.com/spreadsheets/d/[\w-]+(?:/[^\s'\")>]+)?",
+        flags=re.IGNORECASE
+    )
+
+    # Search all hrefs in <a> tags
     for a_tag in soup.find_all("a", href=True):
         href = a_tag["href"]
-        if "docs.google.com/spreadsheets" in href.lower():
-            spreadsheet_links.add(href.split("?")[0])  # remove URL parameters for neatness
+        matches = url_pattern.findall(href)
+        for url in matches:
+            spreadsheet_links.add(url)
 
-    # Additionally, search raw text for spreadsheet URLs (just in case)
-    text = soup.get_text()
-    found_urls = re.findall(r"https?://docs\.google\.com/spreadsheets/[^\s'\"]+", text, re.IGNORECASE)
-    for url in found_urls:
-        spreadsheet_links.add(url.split("?")[0])
+    # Also search the raw text of the page for spreadsheet URLs
+    matches_in_text = url_pattern.findall(soup.get_text())
+    for url in matches_in_text:
+        spreadsheet_links.add(url)
 
     return list(spreadsheet_links)
 
